@@ -1,4 +1,4 @@
-import { app, BrowserWindow, Menu, Tray } from 'electron';
+import { app, BrowserWindow, Menu, screen, Tray } from 'electron';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { startDataServer } from '../scripts/codex-data-server.mjs';
@@ -7,6 +7,7 @@ const currentDirectory = dirname(fileURLToPath(import.meta.url));
 const DATA_PORT = Number(process.env.CODEX_USAGE_PORT || 64111);
 let dataServer = null;
 let mainWindow = null;
+let popoverWindow = null;
 let tray = null;
 let trayTimer = null;
 let isQuitting = false;
@@ -37,6 +38,7 @@ async function ensureDataService() {
 }
 
 function createWindow() {
+  popoverWindow?.hide();
   if (mainWindow) {
     mainWindow.show();
     mainWindow.focus();
@@ -75,6 +77,108 @@ function createWindow() {
     mainWindow = null;
   });
   return window;
+}
+
+function positionPopover() {
+  if (!tray || !popoverWindow) return;
+  const trayBounds = tray.getBounds();
+  const windowBounds = popoverWindow.getBounds();
+  const display = screen.getDisplayNearestPoint({
+    x: Math.round(trayBounds.x + trayBounds.width / 2),
+    y: Math.round(trayBounds.y + trayBounds.height),
+  });
+  const x = Math.min(
+    display.workArea.x + display.workArea.width - windowBounds.width - 8,
+    Math.max(
+      display.workArea.x + 8,
+      Math.round(trayBounds.x + trayBounds.width / 2 - windowBounds.width / 2),
+    ),
+  );
+  const y = Math.round(trayBounds.y + trayBounds.height + 2);
+  popoverWindow.setPosition(x, y, false);
+  const anchorX = Math.min(
+    windowBounds.width - 20,
+    Math.max(20, Math.round(trayBounds.x + trayBounds.width / 2 - x)),
+  );
+  void popoverWindow.webContents
+    .executeJavaScript(
+      `document.documentElement.style.setProperty('--tray-anchor-x', '${anchorX}px')`,
+    )
+    .catch(() => {});
+}
+
+function createPopoverWindow() {
+  if (popoverWindow) return popoverWindow;
+  const window = new BrowserWindow({
+    width: 400,
+    height: 466,
+    show: false,
+    frame: false,
+    transparent: true,
+    resizable: false,
+    maximizable: false,
+    minimizable: false,
+    fullscreenable: false,
+    skipTaskbar: true,
+    hasShadow: true,
+    type: 'panel',
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  });
+  popoverWindow = window;
+  window.setAlwaysOnTop(true, 'pop-up-menu');
+  window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  window.on('blur', () => window.hide());
+  window.on('closed', () => {
+    popoverWindow = null;
+  });
+  window.webContents.on('before-input-event', (event, input) => {
+    if (input.key === 'Escape') {
+      event.preventDefault();
+      window.hide();
+    }
+  });
+  window.webContents.on('will-navigate', (event, url) => {
+    if (!url.startsWith('codex-usage://dashboard')) return;
+    event.preventDefault();
+    window.hide();
+    createWindow();
+  });
+  window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+
+  const query = { port: String(DATA_PORT) };
+  if (process.env.CODEX_USAGE_RENDERER_URL) {
+    const url = new URL('tray.html', process.env.CODEX_USAGE_RENDERER_URL);
+    url.searchParams.set('port', String(DATA_PORT));
+    void window.loadURL(url.href);
+  } else {
+    void window.loadFile(join(currentDirectory, '../desktop-dist/tray.html'), {
+      query,
+    });
+  }
+  return window;
+}
+
+function togglePopover() {
+  const window = createPopoverWindow();
+  if (window.isVisible()) {
+    window.hide();
+    return;
+  }
+  positionPopover();
+  if (window.webContents.isLoading()) {
+    window.once('ready-to-show', () => {
+      positionPopover();
+      window.show();
+      window.focus();
+    });
+    return;
+  }
+  window.show();
+  window.focus();
 }
 
 function formatReset(timestamp) {
@@ -126,15 +230,9 @@ function createTray() {
   );
   tray.setTitle(' …');
   tray.setToolTip('Codex Usage Monitor\nЗагружаю состояние…');
-  tray.on('click', () => {
-    if (!mainWindow) return void createWindow();
-    if (mainWindow.isVisible()) mainWindow.hide();
-    else {
-      mainWindow.show();
-      mainWindow.focus();
-    }
-  });
+  tray.on('click', togglePopover);
   tray.on('right-click', () => {
+    popoverWindow?.hide();
     tray?.popUpContextMenu(
       Menu.buildFromTemplate([
         {

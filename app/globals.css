@@ -142,3 +142,73 @@
 .desktop-titlebar span {
   pointer-events: none;
 }
+
+body.tray-shell {
+  min-height: 100vh;
+  overflow: hidden;
+  background: transparent;
+  background-image: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.tray-notch {
+  left: var(--tray-anchor-x, 50%);
+  width: 16px;
+  height: 10px;
+  border: 1px solid rgb(255 255 255 / 10%);
+  border-right: 0;
+  border-bottom: 0;
+  background: rgb(17 19 24 / 98%);
+  transform: translateX(-50%) rotate(45deg);
+}
+
+.tray-surface {
+  animation: tray-enter 140ms cubic-bezier(0.2, 0, 0, 1);
+  transform-origin: var(--tray-anchor-x, 50%) top;
+}
+
+.tray-week-progress {
+  appearance: none;
+  overflow: hidden;
+  border: 0;
+  border-radius: 999px;
+  background: rgb(255 255 255 / 9%);
+}
+
+.tray-week-progress::-webkit-progress-bar {
+  border-radius: 999px;
+  background: rgb(255 255 255 / 9%);
+}
+
+.tray-week-progress::-webkit-progress-value {
+  border-radius: 999px;
+  background: rgb(167 139 250);
+  transition: width 300ms ease;
+}
+
+.tray-chat-list {
+  scrollbar-width: none;
+}
+
+.tray-chat-list::-webkit-scrollbar {
+  display: none;
+}
+
+@keyframes tray-enter {
+  from {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tray-surface,
+  .live-dot {
+    animation: none;
+  }
+}

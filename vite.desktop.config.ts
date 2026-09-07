@@ -16,5 +16,11 @@ export default defineConfig({
   build: {
     outDir: '../desktop-dist',
     emptyOutDir: true,
+    rolldownOptions: {
+      input: {
+        dashboard: resolve(import.meta.dirname, 'desktop/index.html'),
+        tray: resolve(import.meta.dirname, 'desktop/tray.html'),
+      },
+    },
   },
 });
