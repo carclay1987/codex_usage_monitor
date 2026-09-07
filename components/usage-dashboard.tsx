@@ -44,6 +44,11 @@ import {
 } from '@/components/ui/select';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Switch } from '@/components/ui/switch';
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from '@/components/ui/tooltip';
 
 const API = 'http://127.0.0.1:64111';
 
@@ -71,7 +76,22 @@ type Thread = {
   last: TokenBreakdown | null;
   contextWindow: number | null;
   contextPercent: number | null;
+  weeklyUsagePercent: number | null;
   compactions: number;
+};
+
+type Subagent = {
+  id: string;
+  parentId: string;
+  depth: number;
+  nickname: string | null;
+  taskPath: string | null;
+  model: string | null;
+  reasoningEffort: string | null;
+  cwd: string;
+  status: Thread['status'];
+  total: TokenBreakdown | null;
+  totalTokens: number;
 };
 
 type Overview = {
@@ -92,6 +112,7 @@ type Detail = {
   turns: number;
   compactions: number;
   compactionTimestamps: number[];
+  subagents: Subagent[];
   analysis: TokenAnalysisData;
 };
 
@@ -214,23 +235,37 @@ function projectName(path: string): string {
 
 function HelpLabel({ children, help }: { children: string; help: string }) {
   return (
-    <span className="group relative inline-flex items-center gap-1.5">
+    <span className="inline-flex items-center gap-1.5">
       {children}
-      <button
-        type="button"
-        aria-label={`Что означает «${children}»`}
-        className="peer rounded-full text-slate-400 transition-colors hover:text-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
-      >
-        <Info className="h-3.5 w-3.5" />
-      </button>
-      <span
-        role="tooltip"
-        className="pointer-events-none absolute bottom-[calc(100%+8px)] left-1/2 z-50 hidden w-72 -translate-x-1/2 rounded-xl bg-slate-100 px-3 py-2 text-left text-sm font-normal leading-relaxed text-slate-900 shadow-xl group-hover:block peer-focus:block"
-      >
-        {help}
-      </span>
+      <Tooltip>
+        <TooltipTrigger
+          render={
+            <button
+              type="button"
+              aria-label={`Что означает «${children}»`}
+              className="rounded-full text-slate-400 transition-colors hover:text-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
+            />
+          }
+        >
+          <Info className="h-3.5 w-3.5" />
+        </TooltipTrigger>
+        <TooltipContent
+          side="bottom"
+          align="end"
+          sideOffset={8}
+          className="max-w-[min(18rem,calc(100vw-2rem))] items-start rounded-xl bg-slate-100 px-3 py-2 text-left text-sm font-normal leading-relaxed text-slate-900 shadow-xl"
+        >
+          {help}
+        </TooltipContent>
+      </Tooltip>
     </span>
   );
+}
+
+function weeklyContribution(value: number | null): string {
+  if (value == null) return '—';
+  if (value < 1) return '<1%';
+  return `≈${number.format(value)}%`;
 }
 
 function Meter({
@@ -238,9 +273,15 @@ function Meter({
   tone = 'emerald',
 }: {
   value: number;
-  tone?: 'emerald' | 'violet';
+  tone?: 'emerald' | 'violet' | 'amber' | 'rose';
 }) {
   const percent = Math.min(100, Math.max(0, value));
+  const toneClass = {
+    emerald: 'bg-emerald-400',
+    violet: 'bg-violet-400',
+    amber: 'bg-amber-400',
+    rose: 'bg-rose-400',
+  }[tone];
   return (
     <div className="relative h-2.5 overflow-hidden rounded-full bg-white/10">
       <progress className="sr-only" value={percent} max={100}>
@@ -248,11 +289,17 @@ function Meter({
       </progress>
       <div
         aria-hidden="true"
-        className={`h-full rounded-full transition-[width] duration-300 ${tone === 'violet' ? 'bg-violet-400' : 'bg-emerald-400'}`}
+        className={`h-full rounded-full transition-[width] duration-300 ${toneClass}`}
         style={{ width: `${percent}%` }}
       />
     </div>
   );
+}
+
+function contextMeterTone(value: number | null): 'emerald' | 'amber' | 'rose' {
+  if ((value ?? 0) >= 60) return 'rose';
+  if ((value ?? 0) >= 35) return 'amber';
+  return 'emerald';
 }
 
 export function UsageDashboard() {
@@ -600,7 +647,7 @@ export function UsageDashboard() {
             <div className="mb-3 flex items-center justify-between text-sm text-slate-300">
               <span className="flex items-center gap-2 font-medium">
                 <Zap className="h-4 w-4 text-violet-300" />
-                <HelpLabel help="Доля недельного лимита подписки, которую уже использовал Codex. Значение приходит из последнего ответа сервера.">
+                <HelpLabel help="Общий семидневный лимит Codex. Отдельные лимиты моделей, например GPT‑5.3‑Codex‑Spark, здесь не подменяют основной счётчик.">
                   Недельный лимит
                 </HelpLabel>
               </span>
@@ -617,7 +664,7 @@ export function UsageDashboard() {
             <p className="mt-3 text-sm text-slate-400">
               {overview?.rateLimit?.resetsAt
                 ? `Сброс ${new Date(overview.rateLimit.resetsAt).toLocaleString('ru-RU', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}`
-                : 'Будет показан после нового обращения'}
+                : 'Нет данных об общем недельном лимите'}
             </p>
           </CardContent>
         </Card>
@@ -763,7 +810,9 @@ export function UsageDashboard() {
 
       <p className="mt-4 px-1 text-sm text-slate-500">
         * Сумма по чатам, активным за последние 24 часа; длинные чаты включают
-        накопительный расход.
+        накопительный расход. Вклад чата в неделю — оценка по росту общего
+        счётчика; из-за округления и параллельных задач она не является точным
+        биллингом.
       </p>
       <SettingsDialog
         open={settingsOpen}
@@ -1181,6 +1230,17 @@ function ThreadNavItem({
             <span>
               {thread.contextPercent == null ? '—' : `${Math.round(context)}%`}
             </span>
+            {thread.weeklyUsagePercent != null && (
+              <>
+                <span>·</span>
+                <span
+                  className="text-violet-300"
+                  title="Оценка вклада этого чата в текущий недельный лимит"
+                >
+                  {weeklyContribution(thread.weeklyUsagePercent)} нед.
+                </span>
+              </>
+            )}
             <span className="ml-auto font-sans">
               {relativeTime(thread.updatedAt, now)}
             </span>
@@ -1311,7 +1371,10 @@ function ThreadDetail({
                 : `${Math.round(thread.contextPercent)}%`}
             </span>
           </div>
-          <Meter value={thread.contextPercent ?? 0} />
+          <Meter
+            value={thread.contextPercent ?? 0}
+            tone={contextMeterTone(thread.contextPercent)}
+          />
           <div className="mt-2 flex justify-between font-mono text-[11px] text-zinc-600">
             <span>
               {thread.last ? compact(thread.last.inputTokens) : '—'} сейчас
@@ -1328,7 +1391,7 @@ function ThreadDetail({
           </p>
         </div>
 
-        <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
+        <div className="grid grid-cols-2 gap-2 md:grid-cols-5">
           <SmallStat label="Всего в чате" value={compact(thread.totalTokens)} />
           <SmallStat
             label="Последний запрос"
@@ -1342,7 +1405,15 @@ function ThreadDetail({
             label="Ходов / сжатий"
             value={detail ? `${detail.turns} / ${detail.compactions}` : '—'}
           />
+          <SmallStat
+            label="Вклад в неделю*"
+            value={weeklyContribution(thread.weeklyUsagePercent)}
+          />
         </div>
+
+        {detail?.subagents?.length ? (
+          <SubagentBreakdown subagents={detail.subagents} />
+        ) : null}
 
         {shouldRestart && (
           <div className="rounded-xl border border-amber-300/25 bg-amber-300/[.075] p-4 text-amber-100">
@@ -1448,6 +1519,88 @@ function ThreadDetail({
         </div>
       </CardContent>
     </Card>
+  );
+}
+
+function SubagentBreakdown({ subagents }: { subagents: Subagent[] }) {
+  return (
+    <section className="min-w-0">
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <h3 className="text-sm font-medium text-slate-200">Сабагенты</h3>
+        <span className="text-xs text-slate-500">
+          {subagents.length} в дереве задачи
+        </span>
+      </div>
+      <div className="overflow-x-auto rounded-xl border border-white/8">
+        <table className="w-full min-w-[800px] text-left text-xs">
+          <thead className="bg-white/[.035] text-slate-400">
+            <tr>
+              <th className="p-3 font-medium">Агент и задача</th>
+              <th className="p-3 font-medium">Модель</th>
+              <th className="p-3 text-right font-medium">Вход / кэш</th>
+              <th className="p-3 text-right font-medium">Выход / reasoning</th>
+              <th className="p-3 text-right font-medium">Всего</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-white/6">
+            {subagents.map((agent) => (
+              <tr key={agent.id} className="hover:bg-white/[.025]">
+                <td className="max-w-80 p-3">
+                  <div
+                    className="flex items-center gap-2"
+                    style={{ paddingLeft: `${(agent.depth - 1) * 12}px` }}
+                  >
+                    <span
+                      title={statusLabel(agent.status)}
+                      className={`h-2 w-2 shrink-0 rounded-full ${
+                        agent.status === 'running'
+                          ? 'live-dot bg-emerald-400'
+                          : agent.status === 'failed'
+                            ? 'bg-rose-400'
+                            : agent.status === 'interrupted'
+                              ? 'bg-amber-400'
+                              : 'bg-slate-600'
+                      }`}
+                    />
+                    <span className="truncate font-medium text-slate-200">
+                      {agent.nickname ?? 'Сабагент'}
+                    </span>
+                  </div>
+                  <p
+                    className="mt-1 truncate font-mono text-[11px] text-slate-500"
+                    title={`${agent.taskPath ?? 'без пути'} · ${agent.cwd}`}
+                    style={{ paddingLeft: `${(agent.depth - 1) * 12 + 16}px` }}
+                  >
+                    {agent.taskPath ?? 'без пути'} · {projectName(agent.cwd)}
+                  </p>
+                </td>
+                <td className="p-3">
+                  <p className="font-mono text-slate-300">
+                    {agent.model ?? 'unknown'}
+                  </p>
+                  <p className="mt-1 text-slate-500">
+                    reasoning: {agent.reasoningEffort ?? '—'}
+                  </p>
+                </td>
+                <td className="p-3 text-right font-mono text-slate-300">
+                  {agent.total
+                    ? `${compact(agent.total.inputTokens)} / ${compact(agent.total.cachedInputTokens)}`
+                    : '—'}
+                </td>
+                <td className="p-3 text-right font-mono text-slate-300">
+                  {agent.total
+                    ? `${compact(agent.total.outputTokens)} / ${compact(agent.total.reasoningOutputTokens)}`
+                    : '—'}
+                </td>
+                <td className="p-3 text-right font-mono text-slate-100">
+                  {compact(agent.totalTokens)}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </section>
   );
 }
 

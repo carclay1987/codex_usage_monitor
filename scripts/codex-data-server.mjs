@@ -41,6 +41,7 @@ const DEFAULT_SETTINGS = {
   detailPointLimit: 320,
   analyzeToolOutputs: true,
 };
+const WEEKLY_WINDOW_MINUTES = 7 * 24 * 60;
 
 function clampInteger(value, fallback, min, max) {
   const parsed = Number(value);
@@ -143,6 +144,42 @@ function createRuntime(nextSettings) {
   const turnCount = historyDb.prepare(
     'SELECT COUNT(*) AS count FROM thread_turns WHERE thread_id = ?',
   );
+  const subagentsByParent = stateDb.prepare(`
+    WITH RECURSIVE descendants(parent_id, id, depth) AS (
+      SELECT parent_thread_id, child_thread_id, 1
+      FROM thread_spawn_edges
+      WHERE parent_thread_id = ?
+      UNION ALL
+      SELECT edge.parent_thread_id, edge.child_thread_id, descendants.depth + 1
+      FROM thread_spawn_edges edge
+      JOIN descendants ON edge.parent_thread_id = descendants.id
+    )
+    SELECT descendants.parent_id, descendants.depth, threads.id,
+           threads.rollout_path, threads.agent_nickname, threads.agent_path,
+           threads.model, threads.reasoning_effort, threads.cwd,
+           threads.tokens_used, threads.created_at_ms
+    FROM descendants
+    JOIN threads ON threads.id = descendants.id
+    ORDER BY threads.created_at_ms ASC
+  `);
+  const recentSubagents = stateDb.prepare(`
+    WITH RECURSIVE descendants(root_id, id) AS (
+      SELECT edge.parent_thread_id, edge.child_thread_id
+      FROM thread_spawn_edges edge
+      WHERE NOT EXISTS (
+        SELECT 1 FROM thread_spawn_edges parent
+        WHERE parent.child_thread_id = edge.parent_thread_id
+      )
+      UNION ALL
+      SELECT descendants.root_id, edge.child_thread_id
+      FROM thread_spawn_edges edge
+      JOIN descendants ON edge.parent_thread_id = descendants.id
+    )
+    SELECT descendants.root_id, threads.rollout_path
+    FROM descendants
+    JOIN threads ON threads.id = descendants.id
+    WHERE threads.updated_at_ms >= ?
+  `);
   const savedProjects = stateDb
     .prepare(`
     SELECT p.id, p.name, p.position, r.path
@@ -159,6 +196,8 @@ function createRuntime(nextSettings) {
     threadById,
     latestTurn,
     turnCount,
+    subagentsByParent,
+    recentSubagents,
     savedProjects,
     close() {
       stateDb.close();
@@ -285,6 +324,66 @@ function normalizeStatus(value) {
   if (value === 'failed') return 'failed';
   if (value === 'interrupted') return 'interrupted';
   return 'completed';
+}
+
+function weeklyRateLimit(event) {
+  const rateLimits = event?.payload?.rate_limits;
+  if (!rateLimits) return null;
+  const rate = [rateLimits.primary, rateLimits.secondary].find(
+    (candidate) => Number(candidate?.window_minutes) === WEEKLY_WINDOW_MINUTES,
+  );
+  if (!rate) return null;
+  const timestamp = Date.parse(event.timestamp);
+  const usedPercent = Number(rate.used_percent);
+  if (!Number.isFinite(timestamp) || !Number.isFinite(usedPercent)) return null;
+  return {
+    limitId: String(rateLimits.limit_id || ''),
+    usedPercent,
+    resetsAt: rate.resets_at ? Number(rate.resets_at) * 1000 : null,
+    timestamp,
+  };
+}
+
+function summarizeWeeklyUsage(observations) {
+  const accountObservations = observations.filter(
+    (observation) => observation.limitId === 'codex',
+  );
+  if (accountObservations.length === 0) {
+    return { rateLimit: null, contributions: new Map() };
+  }
+
+  const latest = accountObservations.reduce((newest, observation) =>
+    observation.timestamp > newest.timestamp ? observation : newest,
+  );
+  const currentWindow = accountObservations
+    .filter((observation) => observation.resetsAt === latest.resetsAt)
+    .sort((left, right) => left.timestamp - right.timestamp);
+  let highWaterMark = 0;
+  const contributions = new Map();
+  for (const observation of currentWindow) {
+    if (!contributions.has(observation.threadId)) {
+      contributions.set(observation.threadId, 0);
+    }
+    const nextHighWaterMark = Math.max(
+      highWaterMark,
+      Math.min(100, Math.max(0, observation.usedPercent)),
+    );
+    const increase = nextHighWaterMark - highWaterMark;
+    if (increase > 0) {
+      contributions.set(
+        observation.threadId,
+        (contributions.get(observation.threadId) || 0) + increase,
+      );
+      highWaterMark = nextHighWaterMark;
+    }
+  }
+  return {
+    rateLimit: {
+      usedPercent: highWaterMark,
+      resetsAt: latest.resetsAt,
+    },
+    contributions,
+  };
 }
 
 function startupCategory(text, role) {
@@ -426,7 +525,7 @@ function latestUsage(filePath) {
       last: null,
       total: null,
       contextWindow: null,
-      rateLimit: null,
+      weeklyObservations: [],
       compactions: 0,
       lifecycle: null,
       updatedAt: 0,
@@ -437,6 +536,9 @@ function latestUsage(filePath) {
     settings.overviewTailMb * 1024 * 1024,
   );
   const { events } = snapshot;
+  const weeklyObservations = events
+    .map(weeklyRateLimit)
+    .filter((observation) => observation !== null);
   let tokenEvent = null;
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const candidate = events[index];
@@ -454,7 +556,7 @@ function latestUsage(filePath) {
       last: null,
       total: null,
       contextWindow: null,
-      rateLimit: null,
+      weeklyObservations,
       compactions: snapshot.events.filter(
         (event) => event?.type === 'compacted',
       ).length,
@@ -469,20 +571,13 @@ function latestUsage(filePath) {
     return value;
   }
   const info = tokenEvent.payload.info;
-  const rate = tokenEvent.payload.rate_limits?.primary;
   const value = {
     last: normalizeTokens(info.last_token_usage),
     total: normalizeTokens(info.total_token_usage),
     contextWindow: info.model_context_window
       ? Number(info.model_context_window)
       : null,
-    rateLimit: rate
-      ? {
-          usedPercent: Number(rate.used_percent),
-          resetsAt: rate.resets_at ? Number(rate.resets_at) * 1000 : null,
-          timestamp: Date.parse(tokenEvent.timestamp),
-        }
-      : null,
+    weeklyObservations,
     compactions: events.filter((event) => event?.type === 'compacted').length,
     lifecycle: snapshot.lifecycle,
     updatedAt: snapshot.updatedAt,
@@ -495,10 +590,48 @@ function latestUsage(filePath) {
   return value;
 }
 
+function currentStatus(threadId, usage) {
+  const storedStatus = normalizeStatus(
+    runtime.latestTurn.get(String(threadId))?.status,
+  );
+  const recentlyWritten = Date.now() - Number(usage.updatedAt || 0) < 15_000;
+  return recentlyWritten
+    ? 'running'
+    : usage.lifecycle === 'turn_aborted'
+      ? 'interrupted'
+      : usage.lifecycle === 'task_complete'
+        ? 'completed'
+        : storedStatus;
+}
+
+function getSubagents(parentId) {
+  return runtime.subagentsByParent.all(parentId).map((row) => {
+    const usage = latestUsage(resolve(String(row.rollout_path)));
+    return {
+      id: String(row.id),
+      parentId: String(row.parent_id),
+      depth: Number(row.depth),
+      nickname: row.agent_nickname ? String(row.agent_nickname) : null,
+      taskPath: row.agent_path ? String(row.agent_path) : null,
+      model: row.model ? String(row.model) : null,
+      reasoningEffort: row.reasoning_effort
+        ? String(row.reasoning_effort)
+        : null,
+      cwd: String(row.cwd || ''),
+      status: currentStatus(row.id, usage),
+      total: usage.total,
+      totalTokens: Math.max(
+        Number(row.tokens_used || 0),
+        usage.total?.totalTokens || 0,
+      ),
+    };
+  });
+}
+
 function getOverview() {
   const rows = runtime.recentThreads.all(settings.recentThreadsLimit);
-  let newestRateLimit = null;
-  const threads = rows.map((row) => {
+  const weeklyObservations = [];
+  let threads = rows.map((row) => {
     const cwd = String(row.cwd || '');
     const inferredProject = row.project_id
       ? null
@@ -509,13 +642,12 @@ function getOverview() {
               cwd.startsWith(`${String(project.path).replace(/\/$/, '')}/`)),
         );
     const usage = latestUsage(resolve(String(row.rollout_path)));
-    if (
-      usage.rateLimit &&
-      (!newestRateLimit ||
-        usage.rateLimit.timestamp > newestRateLimit.timestamp)
-    ) {
-      newestRateLimit = usage.rateLimit;
-    }
+    weeklyObservations.push(
+      ...usage.weeklyObservations.map((observation) => ({
+        ...observation,
+        threadId: String(row.id),
+      })),
+    );
     const totalTokens = Math.max(
       Number(row.tokens_used || 0),
       usage.total?.totalTokens || 0,
@@ -524,17 +656,7 @@ function getOverview() {
       usage.last && usage.contextWindow
         ? (usage.last.inputTokens / usage.contextWindow) * 100
         : null;
-    const storedStatus = normalizeStatus(
-      runtime.latestTurn.get(String(row.id))?.status,
-    );
-    const recentlyWritten = Date.now() - Number(usage.updatedAt || 0) < 15_000;
-    const status = recentlyWritten
-      ? 'running'
-      : usage.lifecycle === 'turn_aborted'
-        ? 'interrupted'
-        : usage.lifecycle === 'task_complete'
-          ? 'completed'
-          : storedStatus;
+    const status = currentStatus(row.id, usage);
     return {
       id: String(row.id),
       title: safeTitle(row.display_title),
@@ -569,19 +691,35 @@ function getOverview() {
       last: usage.last,
       contextWindow: usage.contextWindow,
       contextPercent,
+      weeklyUsagePercent: null,
       compactions:
         detailCache.get(String(row.id))?.value.compactions ?? usage.compactions,
     };
   });
+  const visibleThreadIds = new Set(threads.map((thread) => thread.id));
+  const weeklyCutoff = Date.now() - WEEKLY_WINDOW_MINUTES * 60 * 1000;
+  for (const subagent of runtime.recentSubagents.all(weeklyCutoff)) {
+    const rootId = String(subagent.root_id);
+    if (!visibleThreadIds.has(rootId)) continue;
+    const usage = latestUsage(resolve(String(subagent.rollout_path)));
+    weeklyObservations.push(
+      ...usage.weeklyObservations.map((observation) => ({
+        ...observation,
+        threadId: rootId,
+      })),
+    );
+  }
+  const weekly = summarizeWeeklyUsage(weeklyObservations);
+  threads = threads.map((thread) => ({
+    ...thread,
+    weeklyUsagePercent: weekly.contributions.has(thread.id)
+      ? weekly.contributions.get(thread.id)
+      : null,
+  }));
   return {
     generatedAt: Date.now(),
     source: runtime.dataDir,
-    rateLimit: newestRateLimit
-      ? {
-          usedPercent: newestRateLimit.usedPercent,
-          resetsAt: newestRateLimit.resetsAt,
-        }
-      : null,
+    rateLimit: weekly.rateLimit,
     threads,
   };
 }
@@ -595,7 +733,7 @@ async function getDetail(id) {
     fileStat = statSync(filePath);
     const cached = detailCache.get(id);
     if (cached?.size === fileStat.size && cached?.mtimeMs === fileStat.mtimeMs)
-      return cached.value;
+      return { ...cached.value, subagents: getSubagents(id) };
   } catch {
     return null;
   }
@@ -802,7 +940,7 @@ async function getDetail(id) {
     mtimeMs: fileStat.mtimeMs,
     value,
   });
-  return value;
+  return { ...value, subagents: getSubagents(id) };
 }
 
 function addTotals(target, source) {
