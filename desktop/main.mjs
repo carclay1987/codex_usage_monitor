@@ -1,9 +1,10 @@
-import { app, BrowserWindow, Menu, screen, Tray } from 'electron';
+import { app, BrowserWindow, Menu, nativeImage, screen, Tray } from 'electron';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { startDataServer } from '../scripts/codex-data-server.mjs';
 
 const currentDirectory = dirname(fileURLToPath(import.meta.url));
+const APP_ICON_PATH = join(currentDirectory, '../build/icon.svg.png');
 const DATA_PORT = Number(process.env.CODEX_USAGE_PORT || 64111);
 let dataServer = null;
 let mainWindow = null;
@@ -46,13 +47,18 @@ function createWindow() {
   }
   const window = new BrowserWindow({
     title: 'Codex Usage Monitor',
+    icon: APP_ICON_PATH,
     width: 1440,
     height: 940,
     minWidth: 900,
     minHeight: 680,
     backgroundColor: '#080d14',
-    titleBarStyle: 'hiddenInset',
-    trafficLightPosition: { x: 18, y: 18 },
+    ...(process.platform === 'darwin'
+      ? {
+          titleBarStyle: 'hiddenInset',
+          trafficLightPosition: { x: 18, y: 18 },
+        }
+      : {}),
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
@@ -225,29 +231,36 @@ async function updateTray() {
 }
 
 function createTray() {
-  tray = new Tray(
-    join(currentDirectory, '../build/icon.iconset/icon_16x16.png'),
-  );
+  const icon = nativeImage
+    .createFromPath(APP_ICON_PATH)
+    .resize({ width: 16, height: 16 });
+  tray = new Tray(icon);
   tray.setTitle(' …');
   tray.setToolTip('Codex Usage Monitor\nЗагружаю состояние…');
-  tray.on('click', togglePopover);
-  tray.on('right-click', () => {
-    popoverWindow?.hide();
-    tray?.popUpContextMenu(
-      Menu.buildFromTemplate([
-        {
-          label: 'Открыть dashboard',
-          click: () => createWindow(),
-        },
-        {
-          label: 'Обновить сейчас',
-          click: () => void updateTray(),
-        },
-        { type: 'separator' },
-        { label: 'Выйти', role: 'quit' },
-      ]),
-    );
+  tray.on('click', () => {
+    if (process.platform === 'linux') createWindow();
+    else togglePopover();
   });
+  const contextMenu = Menu.buildFromTemplate([
+    {
+      label: 'Открыть dashboard',
+      click: () => createWindow(),
+    },
+    {
+      label: 'Обновить сейчас',
+      click: () => void updateTray(),
+    },
+    { type: 'separator' },
+    { label: 'Выйти', role: 'quit' },
+  ]);
+  if (process.platform === 'linux') {
+    tray.setContextMenu(contextMenu);
+  } else {
+    tray.on('right-click', () => {
+      popoverWindow?.hide();
+      tray?.popUpContextMenu(contextMenu);
+    });
+  }
   void updateTray();
   trayTimer = setInterval(() => void updateTray(), 5000);
 }
@@ -285,6 +298,7 @@ app
     log('data service ready');
     createTray();
     log('tray created');
+    if (process.platform === 'linux') createWindow();
   })
   .catch((error) => {
     log('startup failed', error);
