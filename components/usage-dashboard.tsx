@@ -91,6 +91,8 @@ type Subagent = {
   cwd: string;
   status: Thread['status'];
   total: TokenBreakdown | null;
+  contextWindow: number | null;
+  contextPercent: number | null;
   totalTokens: number;
 };
 
@@ -108,6 +110,7 @@ type DetailPoint = TokenBreakdown & {
 
 type Detail = {
   id: string;
+  contextWindow: number | null;
   points: DetailPoint[];
   turns: number;
   compactions: number;
@@ -139,11 +142,18 @@ type TokenAnalysisData = {
   startup: Array<{ name: string; chars: number; estimatedTokens: number }>;
   startupChars: number;
   categories: UsageMetric[];
+  actions: Array<UsageMetric & { category: string }>;
   tools: Array<{
     name: string;
     category: string;
     calls: number;
     outputChars: number;
+    details: Array<{
+      kind: 'command' | 'file';
+      label: string;
+      calls: number;
+      outputChars: number;
+    }>;
   }>;
   requests: Array<{
     timestamp: number;
@@ -1544,63 +1554,158 @@ function SubagentBreakdown({ subagents }: { subagents: Subagent[] }) {
           </thead>
           <tbody className="divide-y divide-white/6">
             {subagents.map((agent) => (
-              <tr key={agent.id} className="hover:bg-white/[.025]">
-                <td className="max-w-80 p-3">
-                  <div
-                    className="flex items-center gap-2"
-                    style={{ paddingLeft: `${(agent.depth - 1) * 12}px` }}
-                  >
-                    <span
-                      title={statusLabel(agent.status)}
-                      className={`h-2 w-2 shrink-0 rounded-full ${
-                        agent.status === 'running'
-                          ? 'live-dot bg-emerald-400'
-                          : agent.status === 'failed'
-                            ? 'bg-rose-400'
-                            : agent.status === 'interrupted'
-                              ? 'bg-amber-400'
-                              : 'bg-slate-600'
-                      }`}
-                    />
-                    <span className="truncate font-medium text-slate-200">
-                      {agent.nickname ?? 'Сабагент'}
-                    </span>
-                  </div>
-                  <p
-                    className="mt-1 truncate font-mono text-[11px] text-slate-500"
-                    title={`${agent.taskPath ?? 'без пути'} · ${agent.cwd}`}
-                    style={{ paddingLeft: `${(agent.depth - 1) * 12 + 16}px` }}
-                  >
-                    {agent.taskPath ?? 'без пути'} · {projectName(agent.cwd)}
-                  </p>
-                </td>
-                <td className="p-3">
-                  <p className="font-mono text-slate-300">
-                    {agent.model ?? 'unknown'}
-                  </p>
-                  <p className="mt-1 text-slate-500">
-                    reasoning: {agent.reasoningEffort ?? '—'}
-                  </p>
-                </td>
-                <td className="p-3 text-right font-mono text-slate-300">
-                  {agent.total
-                    ? `${compact(agent.total.inputTokens)} / ${compact(agent.total.cachedInputTokens)}`
-                    : '—'}
-                </td>
-                <td className="p-3 text-right font-mono text-slate-300">
-                  {agent.total
-                    ? `${compact(agent.total.outputTokens)} / ${compact(agent.total.reasoningOutputTokens)}`
-                    : '—'}
-                </td>
-                <td className="p-3 text-right font-mono text-slate-100">
-                  {compact(agent.totalTokens)}
-                </td>
-              </tr>
+              <SubagentRow key={agent.id} agent={agent} />
             ))}
           </tbody>
         </table>
       </div>
     </section>
+  );
+}
+
+function SubagentRow({ agent }: { agent: Subagent }) {
+  const [expanded, setExpanded] = useState(false);
+  const [detail, setDetail] = useState<Detail | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(false);
+
+  const toggle = async () => {
+    const next = !expanded;
+    setExpanded(next);
+    if (!next || detail || loading) return;
+    setLoading(true);
+    setError(false);
+    try {
+      const response = await fetch(`${API}/api/threads/${agent.id}`, {
+        cache: 'no-store',
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      setDetail((await response.json()) as Detail);
+    } catch {
+      setError(true);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <>
+      <tr
+        className="cursor-pointer hover:bg-white/[.025]"
+        onClick={() => void toggle()}
+        aria-expanded={expanded}
+      >
+        <td className="max-w-80 p-3">
+          <div
+            className="flex items-center gap-2"
+            style={{ paddingLeft: `${(agent.depth - 1) * 12}px` }}
+          >
+            <ChevronRight
+              className={`h-3.5 w-3.5 shrink-0 text-slate-500 transition-transform ${expanded ? 'rotate-90' : ''}`}
+            />
+            <span
+              title={statusLabel(agent.status)}
+              className={`h-2 w-2 shrink-0 rounded-full ${
+                agent.status === 'running'
+                  ? 'live-dot bg-emerald-400'
+                  : agent.status === 'failed'
+                    ? 'bg-rose-400'
+                    : agent.status === 'interrupted'
+                      ? 'bg-amber-400'
+                      : 'bg-slate-600'
+              }`}
+            />
+            <span className="truncate font-medium text-slate-200">
+              {agent.nickname ?? 'Сабагент'}
+            </span>
+          </div>
+          <p
+            className="mt-1 truncate font-mono text-[11px] text-slate-500"
+            title={`${agent.taskPath ?? 'без пути'} · ${agent.cwd}`}
+            style={{ paddingLeft: `${(agent.depth - 1) * 12 + 30}px` }}
+          >
+            {agent.taskPath ?? 'без пути'} · {projectName(agent.cwd)}
+          </p>
+        </td>
+        <td className="p-3">
+          <p className="font-mono text-slate-300">{agent.model ?? 'unknown'}</p>
+          <p className="mt-1 text-slate-500">
+            reasoning: {agent.reasoningEffort ?? '—'}
+          </p>
+        </td>
+        <td className="p-3 text-right font-mono text-slate-300">
+          {agent.total
+            ? `${compact(agent.total.inputTokens)} / ${compact(agent.total.cachedInputTokens)}`
+            : '—'}
+        </td>
+        <td className="p-3 text-right font-mono text-slate-300">
+          {agent.total
+            ? `${compact(agent.total.outputTokens)} / ${compact(agent.total.reasoningOutputTokens)}`
+            : '—'}
+        </td>
+        <td className="p-3 text-right font-mono text-slate-100">
+          {compact(agent.totalTokens)}
+        </td>
+      </tr>
+      {expanded && (
+        <tr>
+          <td colSpan={5} className="bg-black/15 p-4 sm:p-5">
+            {loading ? (
+              <Skeleton className="h-64 w-full rounded-xl bg-white/5" />
+            ) : error ? (
+              <p className="text-sm text-rose-300">
+                Не удалось загрузить детализацию сабагента
+              </p>
+            ) : detail ? (
+              <div className="space-y-5">
+                <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
+                  <SmallStat
+                    label="Запросов к модели"
+                    value={compact(detail.analysis.totals.modelRequests)}
+                  />
+                  <SmallStat
+                    label="Вход суммарно"
+                    value={compact(detail.analysis.totals.inputTokens)}
+                  />
+                  <SmallStat
+                    label="Выход"
+                    value={compact(detail.analysis.totals.outputTokens)}
+                  />
+                  <SmallStat
+                    label="Ходов / сжатий"
+                    value={`${detail.turns} / ${detail.compactions}`}
+                  />
+                </div>
+                <div>
+                  <p className="mb-3 text-sm font-medium text-slate-200">
+                    Рост контекста сабагента
+                  </p>
+                  <div className="h-56 min-w-0 rounded-xl border border-white/8 bg-black/10 p-2">
+                    {detail.points.length ? (
+                      <ContextChart
+                        key={detail.id}
+                        points={detail.points}
+                        compactionTimestamps={detail.compactionTimestamps}
+                      />
+                    ) : (
+                      <div className="grid h-full place-items-center text-xs text-zinc-600">
+                        История ещё не собрана
+                      </div>
+                    )}
+                  </div>
+                </div>
+                <TokenAnalysis
+                  analysis={detail.analysis}
+                  contextWindow={detail.contextWindow}
+                  compactions={detail.compactions}
+                  loading={false}
+                />
+              </div>
+            ) : null}
+          </td>
+        </tr>
+      )}
+    </>
   );
 }
 
@@ -1621,6 +1726,11 @@ function TokenAnalysis({
   if (!analysis) return null;
 
   const { totals } = analysis;
+  const actions = analysis.actions ?? [];
+  const tools = (analysis.tools ?? []).map((tool) => ({
+    ...tool,
+    details: tool.details ?? [],
+  }));
   const cacheShare = totals.inputTokens
     ? Math.round((totals.cachedInputTokens / totals.inputTokens) * 100)
     : 0;
@@ -1628,7 +1738,7 @@ function TokenAnalysis({
     ? Math.round((totals.peakInputTokens / contextWindow) * 100)
     : null;
   const topCategory = analysis.categories[0];
-  const topTool = analysis.tools[0];
+  const topTool = tools[0];
   const lastRequest = analysis.requests.at(-1);
   const startupBase = analysis.startup
     .filter((item) => item.name !== 'Первый запрос пользователя')
@@ -1719,17 +1829,23 @@ function TokenAnalysis({
 
         <AnalysisPanel title="Повторная обработка входа" icon={Activity} open>
           <p className="mb-3 text-xs leading-relaxed text-slate-500">
-            Точная сумма входных токенов запросов, сгруппированных по тому,
-            какое действие модель решила выполнить.
+            После каждого ответа или инструмента модель вызывается снова и
+            получает текущую историю целиком. Поэтому одни и те же токены могут
+            учитываться много раз. Здесь показан объём такого повторного входа
+            по следующему действию модели. Он влияет на общий расход обработки и
+            время шага; кэш снижает фактическую работу, а заполнение окна
+            определяется последним запросом, не этой суммой.
           </p>
           <div className="space-y-3">
             {analysis.categories.map((item) => (
-              <MetricBar
+              <CategoryMetric
                 key={item.name}
-                label={item.name}
-                value={item.inputTokens}
+                item={item}
                 maximum={maxCategory}
-                suffix={`${item.requests} запросов`}
+                actions={actions.filter(
+                  (action) => action.category === item.name,
+                )}
+                tools={tools.filter((tool) => tool.category === item.name)}
               />
             ))}
           </div>
@@ -1761,24 +1877,32 @@ function TokenAnalysis({
             следующего запроса. Размер показан в символах до токенизации.
           </p>
           <div className="divide-y divide-white/6">
-            {analysis.tools.slice(0, 12).map((tool) => (
-              <div
-                key={tool.name}
-                className="flex items-center justify-between gap-4 py-2.5 text-sm"
-              >
-                <div className="min-w-0">
-                  <p className="truncate font-mono text-slate-200">
-                    {tool.name}
-                  </p>
-                  <p className="text-xs text-slate-500">{tool.category}</p>
-                </div>
-                <div className="shrink-0 text-right font-mono text-slate-300">
-                  <p>{tool.calls} выз.</p>
-                  <p className="text-xs text-slate-500">
-                    {compact(tool.outputChars)} симв.
-                  </p>
-                </div>
-              </div>
+            {tools.slice(0, 12).map((tool) => (
+              <details key={tool.name} className="group py-2.5 text-sm">
+                <summary
+                  aria-label={`Показать детали инструмента ${tool.name}`}
+                  className="flex cursor-pointer list-none items-center justify-between gap-4"
+                >
+                  <div className="min-w-0">
+                    <p className="flex items-center gap-1.5 truncate font-mono text-slate-200">
+                      {tool.details.length > 0 && (
+                        <ChevronRight className="h-3.5 w-3.5 shrink-0 transition-transform group-open:rotate-90" />
+                      )}
+                      {tool.name}
+                    </p>
+                    <p className="text-xs text-slate-500">{tool.category}</p>
+                  </div>
+                  <div className="shrink-0 text-right font-mono text-slate-300">
+                    <p>{tool.calls} выз.</p>
+                    <p className="text-xs text-slate-500">
+                      {compact(tool.outputChars)} симв.
+                    </p>
+                  </div>
+                </summary>
+                {tool.details.length > 0 && (
+                  <InvocationList details={tool.details} />
+                )}
+              </details>
             ))}
           </div>
         </AnalysisPanel>
@@ -1897,6 +2021,155 @@ function MetricBar({
         />
       </div>
       <p className="mt-1 text-xs text-slate-500">{suffix}</p>
+    </div>
+  );
+}
+
+function CategoryMetric({
+  item,
+  maximum,
+  actions,
+  tools,
+}: {
+  item: UsageMetric;
+  maximum: number;
+  actions: Array<UsageMetric & { category: string }>;
+  tools: TokenAnalysisData['tools'];
+}) {
+  const hasDetails = actions.length > 0 || tools.length > 0;
+  return (
+    <details className="group rounded-lg border border-white/6 bg-black/10 px-3 py-2.5">
+      <summary
+        aria-label={`Показать детализацию категории ${item.name}`}
+        className="cursor-pointer list-none"
+      >
+        <div className="flex items-start gap-2">
+          {hasDetails && (
+            <ChevronRight className="mt-0.5 h-4 w-4 shrink-0 text-slate-500 transition-transform group-open:rotate-90" />
+          )}
+          <div className="min-w-0 flex-1">
+            <MetricBar
+              label={item.name}
+              value={item.inputTokens}
+              maximum={maximum}
+              suffix={`${item.requests} запросов · ${compact(item.cachedInputTokens)} из кэша`}
+            />
+          </div>
+        </div>
+      </summary>
+      {hasDetails && (
+        <div className="ml-6 mt-3 space-y-3 border-l border-white/8 pl-3">
+          {actions.map((action) => (
+            <ActionMetric
+              key={action.name}
+              action={action}
+              tool={tools.find((tool) => tool.name === action.name)}
+            />
+          ))}
+        </div>
+      )}
+    </details>
+  );
+}
+
+function ActionMetric({
+  action,
+  tool,
+}: {
+  action: UsageMetric & { category: string };
+  tool: TokenAnalysisData['tools'][number] | undefined;
+}) {
+  const hasDetails = Boolean(tool?.details.length);
+  const content = (
+    <div className="flex min-w-0 flex-1 items-start justify-between gap-3 text-xs">
+      <div className="min-w-0">
+        <p className="truncate font-mono text-slate-300">{action.name}</p>
+        <p className="mt-0.5 text-slate-500">
+          {action.requests} запросов · {compact(action.cachedInputTokens)} из
+          кэша
+        </p>
+      </div>
+      <span className="shrink-0 font-mono text-slate-200">
+        {compact(action.inputTokens)}
+      </span>
+    </div>
+  );
+
+  if (!hasDetails || !tool) return content;
+  return (
+    <details className="group/action rounded-lg bg-white/[.025] p-2.5">
+      <summary
+        aria-label={`Показать примеры ${action.name}`}
+        className="flex cursor-pointer list-none items-start gap-2"
+      >
+        <ChevronRight className="mt-0.5 h-3.5 w-3.5 shrink-0 text-slate-500 transition-transform group-open/action:rotate-90" />
+        {content}
+      </summary>
+      <InvocationGroups details={tool.details} />
+    </details>
+  );
+}
+
+function InvocationGroups({
+  details,
+}: {
+  details: TokenAnalysisData['tools'][number]['details'];
+}) {
+  const commands = details.filter((detail) => detail.kind === 'command');
+  const files = details.filter((detail) => detail.kind === 'file');
+  return (
+    <div className="ml-5 mt-3 space-y-3 border-l border-white/8 pl-3">
+      {commands.length > 0 && (
+        <div>
+          <p className="flex items-center gap-1.5 text-xs font-medium text-slate-500">
+            <Terminal className="h-3.5 w-3.5" />
+            Команды
+          </p>
+          <InvocationList details={commands.slice(0, 6)} />
+        </div>
+      )}
+      {files.length > 0 && (
+        <div>
+          <p className="flex items-center gap-1.5 text-xs font-medium text-slate-500">
+            <FolderKanban className="h-3.5 w-3.5" />
+            Файлы
+          </p>
+          <InvocationList details={files.slice(0, 6)} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function InvocationList({
+  details,
+}: {
+  details: TokenAnalysisData['tools'][number]['details'];
+}) {
+  return (
+    <div className="mt-2 space-y-1.5 border-l border-white/8 pl-3">
+      {details.map((detail) => (
+        <div
+          key={`${detail.kind}-${detail.label}`}
+          className="flex items-start justify-between gap-3 text-xs"
+        >
+          <p
+            className="min-w-0 break-words font-mono leading-relaxed text-slate-400"
+            title={detail.label}
+          >
+            <span className="mr-1.5 text-slate-600">
+              {detail.kind === 'command' ? '$' : 'файл'}
+            </span>
+            {detail.label}
+          </p>
+          <span className="shrink-0 whitespace-nowrap font-mono text-slate-500">
+            {detail.calls}×
+            {detail.kind === 'command'
+              ? ` · ${compact(detail.outputChars)} симв.`
+              : ''}
+          </span>
+        </div>
+      ))}
     </div>
   );
 }
