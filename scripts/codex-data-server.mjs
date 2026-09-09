@@ -409,6 +409,81 @@ function toolName(name, input = '') {
   return nested || String(name || 'неизвестный инструмент');
 }
 
+function parsedCallInput(input) {
+  if (input && typeof input === 'object') return input;
+  try {
+    return JSON.parse(String(input || ''));
+  } catch {
+    return null;
+  }
+}
+
+function quotedField(source, field) {
+  const match = String(source || '').match(
+    new RegExp(`${field}\\s*:\\s*("(?:\\\\.|[^"\\\\])*")`),
+  );
+  if (!match) return null;
+  try {
+    return JSON.parse(match[1]);
+  } catch {
+    return null;
+  }
+}
+
+function compactInvocation(value, limit = 240) {
+  const normalized = String(value || '')
+    .split(/\r?\n/, 1)[0]
+    .replace(/\s+/g, ' ')
+    .replace(
+      /((?:^|\s)[A-Z][A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|API_KEY)=)(?:'[^']*'|"[^"]*"|\S+)/g,
+      '$1•••',
+    )
+    .replace(
+      /(--?(?:token|secret|password|api[-_]?key)\s+)(?:'[^']*'|"[^"]*"|\S+)/gi,
+      '$1•••',
+    )
+    .trim();
+  if (!normalized) return null;
+  return normalized.length <= limit
+    ? normalized
+    : `${normalized.slice(0, limit - 1)}…`;
+}
+
+function commandFiles(command) {
+  const firstLine = String(command || '').split(/\r?\n/, 1)[0];
+  const files = new Set();
+  for (const match of firstLine.matchAll(/(['"])([^'"\n]+\/[^'"\n]+)\1/g)) {
+    const value = match[2];
+    if (!/^https?:\/\//i.test(value)) files.add(value);
+  }
+  return [...files]
+    .map((value) => compactInvocation(value, 180))
+    .filter(Boolean)
+    .map((label) => ({ kind: 'file', label }));
+}
+
+function invocationDetails(name, input) {
+  const raw = String(input || '');
+  const parsed = parsedCallInput(input);
+  if (name === 'exec_command') {
+    const command = parsed?.cmd || quotedField(raw, 'cmd');
+    const label = compactInvocation(command);
+    return label ? [{ kind: 'command', label }, ...commandFiles(command)] : [];
+  }
+  if (name === 'apply_patch') {
+    const patch = (
+      typeof input === 'string' ? input : String(parsed?.input || '')
+    ).replace(/\\n/g, '\n');
+    return [...patch.matchAll(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/gm)]
+      .map((match) => compactInvocation(match[1]))
+      .filter(Boolean)
+      .map((label) => ({ kind: 'file', label }));
+  }
+  const path = parsed?.path || parsed?.target?.path;
+  const label = compactInvocation(path);
+  return label ? [{ kind: 'file', label }] : [];
+}
+
 function contentLength(value) {
   if (typeof value === 'string') return value.length;
   if (Array.isArray(value))
@@ -454,6 +529,25 @@ function actionCategory(name) {
 function addMetric(map, key, usage) {
   const current = map.get(key) || {
     name: key,
+    requests: 0,
+    inputTokens: 0,
+    cachedInputTokens: 0,
+    outputTokens: 0,
+    reasoningOutputTokens: 0,
+  };
+  current.requests += 1;
+  current.inputTokens += Number(usage.input_tokens || 0);
+  current.cachedInputTokens += Number(usage.cached_input_tokens || 0);
+  current.outputTokens += Number(usage.output_tokens || 0);
+  current.reasoningOutputTokens += Number(usage.reasoning_output_tokens || 0);
+  map.set(key, current);
+}
+
+function addActionMetric(map, category, label, usage) {
+  const key = `${category}\u0000${label}`;
+  const current = map.get(key) || {
+    name: label,
+    category,
     requests: 0,
     inputTokens: 0,
     cachedInputTokens: 0,
@@ -620,6 +714,11 @@ function getSubagents(parentId) {
       cwd: String(row.cwd || ''),
       status: currentStatus(row.id, usage),
       total: usage.total,
+      contextWindow: usage.contextWindow,
+      contextPercent:
+        usage.last && usage.contextWindow
+          ? (usage.last.inputTokens / usage.contextWindow) * 100
+          : null,
       totalTokens: Math.max(
         Number(row.tokens_used || 0),
         usage.total?.totalTokens || 0,
@@ -741,13 +840,15 @@ async function getDetail(id) {
   const requests = [];
   const startupParts = new Map();
   const categoryMetrics = new Map();
+  const actionMetrics = new Map();
   const toolMetrics = new Map();
-  const callNames = new Map();
+  const callRecords = new Map();
   const turnIds = new Set();
   const compactionTimestamps = [];
   let compactions = 0;
   let firstUsage = null;
   let previousInput = null;
+  let contextWindow = null;
   let pendingAction = { category: 'Ответы пользователю', label: 'Ответ' };
   let charsSinceUsage = 0;
   const reader = createInterface({
@@ -795,17 +896,30 @@ async function getDetail(id) {
       }
 
       if (['custom_tool_call', 'function_call'].includes(payload.type)) {
-        const name = toolName(payload.name, payload.input || payload.arguments);
+        const rawInput = payload.input || payload.arguments;
+        const name = toolName(payload.name, rawInput);
         const category = actionCategory(name);
         const callId = String(payload.call_id || payload.id || '');
-        if (callId) callNames.set(callId, name);
+        const details = invocationDetails(name, rawInput);
+        if (callId) callRecords.set(callId, { name, details });
         const metric = toolMetrics.get(name) || {
           name,
           category,
           calls: 0,
           outputChars: 0,
+          details: new Map(),
         };
         metric.calls += 1;
+        for (const detail of details) {
+          const key = `${detail.kind}\u0000${detail.label}`;
+          const current = metric.details.get(key) || {
+            ...detail,
+            calls: 0,
+            outputChars: 0,
+          };
+          current.calls += 1;
+          metric.details.set(key, current);
+        }
         toolMetrics.set(name, metric);
         pendingAction = { category, label: name };
       }
@@ -817,10 +931,18 @@ async function getDetail(id) {
       ) {
         const outputChars = contentLength(payload.output);
         charsSinceUsage += outputChars;
-        const name = callNames.get(String(payload.call_id || ''));
-        if (name && settings.analyzeToolOutputs) {
-          const metric = toolMetrics.get(name);
-          if (metric) metric.outputChars += outputChars;
+        const call = callRecords.get(String(payload.call_id || ''));
+        if (call && settings.analyzeToolOutputs) {
+          const metric = toolMetrics.get(call.name);
+          if (metric) {
+            metric.outputChars += outputChars;
+            for (const detail of call.details) {
+              const item = metric.details.get(
+                `${detail.kind}\u0000${detail.label}`,
+              );
+              if (item) item.outputChars += outputChars;
+            }
+          }
         }
       }
     }
@@ -834,6 +956,7 @@ async function getDetail(id) {
       const category = isFirst ? 'Стартовый пакет' : pendingAction.category;
       const label = isFirst ? 'Первый запрос модели' : pendingAction.label;
       addMetric(categoryMetrics, category, usage);
+      addActionMetric(actionMetrics, category, label, usage);
       requests.push({
         timestamp: Date.parse(event.timestamp),
         category,
@@ -853,6 +976,8 @@ async function getDetail(id) {
     if (event?.type === 'event_msg' && payload.type === 'token_count') {
       const info = payload.info;
       if (!info?.last_token_usage) continue;
+      if (info.model_context_window)
+        contextWindow = Number(info.model_context_window);
       const last = normalizeTokens(info.last_token_usage);
       points.push({
         ...last,
@@ -910,6 +1035,7 @@ async function getDetail(id) {
   );
   const value = {
     id,
+    contextWindow,
     points: points.filter(
       (_, index) => index % stride === 0 || index === points.length - 1,
     ),
@@ -926,9 +1052,18 @@ async function getDetail(id) {
       categories: [...categoryMetrics.values()].sort(
         (a, b) => b.inputTokens - a.inputTokens,
       ),
+      actions: [...actionMetrics.values()].sort(
+        (a, b) => b.inputTokens - a.inputTokens,
+      ),
       tools: [...toolMetrics.values()]
         .sort((a, b) => b.outputChars - a.outputChars)
-        .slice(0, 20),
+        .slice(0, 20)
+        .map((tool) => ({
+          ...tool,
+          details: [...tool.details.values()]
+            .sort((a, b) => b.outputChars - a.outputChars || b.calls - a.calls)
+            .slice(0, 20),
+        })),
       requests:
         requests.length <= 160
           ? requests
